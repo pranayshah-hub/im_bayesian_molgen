@@ -42,7 +42,6 @@ from tensorflow.contrib.distributions import Normal
 
 from bbb import DenseReparameterisation, WeightPriorStudent, WeightPriorARD, WeightPriorMOG
 from bbb_utils import *
-from ids_utils import *
 
 
 class DeepBBQNetwork(object):
@@ -104,7 +103,6 @@ class DeepBBQNetwork(object):
         self.scope = scope
         self.reuse = reuse
         self.epsilon = epsilon
-        self.num_sigma = 2 # 3
 
         self._batch_size = self.ipt_shape[0]
         self._input_size = hparams.fingerprint_length  # self.ipt_shape[-1]
@@ -116,14 +114,7 @@ class DeepBBQNetwork(object):
         if self.hparams.num_bootstrap_heads:
             out_size = self.hparams.num_bootstrap_heads
         else:
-            if self.hparams.reward_eng == 'ids' \
-                    or self.hparams.reward_eng == 'ids_2' \
-                    or self.hparams.reward_eng == 'info_gain' \
-                    or self.hparams.exp == 'ids':
-            # One for Q-values, one for aleatory uncertainty
-                out_size = 2
-            else:
-                out_size = 1
+            out_size = 1
 
         dims = [in_size] + self.hparams.dense_layers + [out_size]
         # self.W_dims = []
@@ -275,7 +266,6 @@ class DeepBBQNetwork(object):
             self.observations = tf.placeholder(tf.float32, [None, fingerprint_length], name='observations')
             # head is the index of the head we want to choose for decison.
             self.head = tf.placeholder(tf.int32, [], name='head')
-            self.aleatoric_head = tf.placeholder(tf.int32, [], name='aleatoric_head')
             # When sample from memory, the batch_size can be fixed, as it is
             # possible to sample any number of samples from memory.
             # state_t is the state at time step t
@@ -359,9 +349,9 @@ class DeepBBQNetwork(object):
         #                                                             n_samples=1,
         #                                                             sample_type="Sample")
 
-        return out_std, new_means, out_mean
+        return out_mean, new_means, out_mean
 
-    def _build_single_q_network(self, observations, head, aleatoric_head, state_t, state_tp1,
+    def _build_single_q_network(self, observations, head, state_t, state_tp1,
                                 done_mask, reward_t, error_weight, kl_weight):  # add sn if changing TS frequency
         """Builds the computational graph for a single Q network.
 
@@ -415,11 +405,10 @@ class DeepBBQNetwork(object):
                     print('I am about to build the online mlp for the 2nd dqn: \n')
                     self._build_mlp(scope='q_fn')
 
-            # actions * num_samples
+            # mean, list, sample
             with tf.variable_scope('q_fn'):
-                q_stds, q_values_means, q_values = self._mlp_online(observations, self.layers_online)
+                _, _, q_values = self._mlp_online(observations, self.layers_online)
                 q_values = tf.gather(q_values, head, axis=-1)
-                q_stds = tf.gather(q_stds, head, axis=-1)
 
         else:
             if not self.built_flag1:
@@ -436,18 +425,17 @@ class DeepBBQNetwork(object):
         # The Q network shares parameters with the action graph.
         with tf.variable_scope('q_fn', reuse=True):
             q_t, qt_list, _ = self._mlp_online(state_t, self.layers_online)
-            if self.hparams.reward_eng == 'ids' \
-            or self.hparams.reward_eng == 'ids_2' \
-            or self.hparams.reward_eng == 'info_gain' \
-            or self.hparams.exp == 'ids':
-                q_t = tf.expand_dims(tf.gather(qt, head, axis=-1), 1)
-                lpv = compute_log_predictive_variance(qt_list, aleatoric_head)
+        # q_t = tf.stack(qt_list, axis=-1)
 
         # bayesian_loss = kl_loss
         bayesian_loss = 0.0
         for i in range(len(self.hparams.dense_layers)):
             bayesian_loss += self.layers_online['dense_{}'.format(i)].get_bayesian_loss()
         bayesian_loss += self.layers_online['dense_final'].get_bayesian_loss()
+        # if all(state_t.shape):
+        #     if isinstance(state_t.shape[0], int):
+        #         bayesian_loss = tf.ones([state_t.shape[0], 1]) * bayesian_loss
+        #         print(bayesian_loss.shape)
 
         # Online network parameters
         q_fn_vars = tf.trainable_variables(scope=tf.get_variable_scope().name + '/q_fn')
@@ -477,7 +465,7 @@ class DeepBBQNetwork(object):
                 _, _, q_tp1 = zip(
                     *[self._mlp_online(s_tp1, self.layers_target, reuse=tf.AUTO_REUSE) for s_tp1 in
                       state_tp1])
-            q_tp1 = [tf.expand_dims(tf.gather(q_tp1_i, head, axis=-1), 1) for q_tp1_i in q_tp1]
+            # q_tp1 = [tf.stack(q_tp1_i, axis=-1) for q_tp1_i in q_tp1_list]
         # Target network parameters
         q_tp1_vars = tf.trainable_variables(scope=tf.get_variable_scope().name + '/q_tp1')
         print(q_tp1_vars)
@@ -496,7 +484,7 @@ class DeepBBQNetwork(object):
                         q_tp1_online, q_tp1_online_list, _ = zip(*[self._mlp_online(s_tp1, self.layers_online,
                                                                                     reuse=True) for s_tp1 in state_tp1])
 
-                q_tp1_online = [tf.expand_dims(tf.gather(q_tp1_online_i, head, axis=-1), 1) for q_tp1_online_i in q_tp1_online]
+                # q_tp1_online = [tf.stack(q_tp1_online_i, axis=-1) for q_tp1_online_i in q_tp1_online_list]
             if self.num_bootstrap_heads:
                 num_heads = self.num_bootstrap_heads
             else:
@@ -521,24 +509,20 @@ class DeepBBQNetwork(object):
         td_error = td_target - q_t
 
         # Bayesian Loss (Expected variational log posterior - Expected log prior)
+        # if self.hparams.bayesian_loss == 'stochastic':
+        #     bayesian_loss = tf.reduce_mean(tf.abs(bayesian_loss))
+        # else:
+        #     bayesian_loss = tf.abs(bayesian_loss)
         weighted_bayesian_loss = bayesian_loss * kl_weight
 
         # Expected Log-likelihood Huber Loss
         errors = tf.where(tf.abs(td_error) < 1.0, tf.square(td_error) * 0.5, 1.0 * (tf.abs(td_error) - 0.5))
-        if self.hparams.reward_eng == 'ids' \
-            or self.hparams.reward_eng == 'ids_2' \
-            or self.hparams.reward_eng == 'info_gain' \
-            or self.hparams.exp == 'ids':
-            # To deal with lpv = NaN:
-            lpv = tf.where(lpv > -math.inf, lpv, tf.constant(0.0, dtype=tf.float32, shape=[self.hparams.batch_size]))
-            errors = (errors * (1.0 / tf.exp(lpv)))
-            weighted_error = tf.reduce_mean(error_weight * errors + 0.5 * lpv)
-        else:
-            log_weighted_error = error_weight * errors
-            weighted_error = tf.reduce_mean(log_weighted_error)
+        log_weighted_error = error_weight * errors
+        weighted_error = tf.reduce_mean(log_weighted_error)  # reduce mean converts loss to scalar
 
         # Total Loss
-        total_loss = weighted_bayesian_loss + weighted_error
+        # total_loss = tf.reduce_mean(weighted_bayesian_loss + weighted_error)  # reduce mean converts loss to scalar
+        total_loss = weighted_bayesian_loss + weighted_error  # reduce mean converts loss to scalar
 
         if self.built_number >= 2:
             self.built_flag1 = True
@@ -547,11 +531,26 @@ class DeepBBQNetwork(object):
         print('Built status 1: ' + str(self.built_flag1))
         print('Built status 2: ' + str(self.built_flag2))
 
+        # Calculate the mean gradient
+        tvars = q_fn_vars
+        # grads = [tf.squeeze(tf.clip_by_norm(tf.gradients(td_error, var), self.hparams.grad_clipping), axis=0) for var in tvars]
+        #gradients = [
+        #    tf.squeeze(tf.clip_by_norm(tf.gradients(td_error[:, :, i], tvars[0]), self.hparams.grad_clipping), 0) for i
+        #    in range(10)]
+        #mean_grad = tf.reduce_mean(tf.stack(gradients, axis=-1), axis=-1)
+        #squared_differences = [tf.square(gradients[i] - mean_grad) for i in range(10)]
+        #grad_var = tf.reduce_mean(tf.stack(squared_differences, axis=-1))
+
+        # Log-likelihood variance
+        #mu_td = tf.reduce_mean(td_error)
+        #mu_td_centr = tf.square(td_error - tf.expand_dims(mu_td, axis=-1))
+        #log_like_var = tf.reduce_mean(mu_td_centr)
+
         if self.hparams.thomp_freq == 20:
-            return (q_stds, q_values, q_values_means, td_error, weighted_error, weighted_bayesian_loss,
+            return (q_values, td_error, weighted_error, weighted_bayesian_loss,
                     total_loss, q_fn_vars, q_tp1_vars, q_thomp_vars, grad_var, log_like_var)
         else:
-            return (q_stds, q_values, q_values_means, td_error, weighted_error, weighted_bayesian_loss,
+            return (q_values, td_error, weighted_error, weighted_bayesian_loss,
                     total_loss, q_fn_vars, q_tp1_vars) #, grad_var, log_like_var)
 
     def _build_graph(self):
@@ -583,9 +582,7 @@ class DeepBBQNetwork(object):
             # tenors start with q or v have shape [batch_size, 1] when not using
             # bootstrap. When using bootstrap, the shapes are [batch_size, num_bootstrap_heads]
             if self.hparams.thomp_freq == 20:
-                (self.q_stds,
-                 self.q_values,
-                 self.q_values_means,
+                (self.q_values,
                  self.td_error,
                  self.weighted_error,
                  self.weighted_bayesian_loss,
@@ -596,7 +593,6 @@ class DeepBBQNetwork(object):
                  self.grad_var,
                  self.log_like_var) = self._build_single_q_network(self.observations,
                                                                    self.head,
-                                                                   self.aleatoric_head,
                                                                    self.state_t,
                                                                    self.state_tp1,
                                                                    self.done_mask,
@@ -604,9 +600,7 @@ class DeepBBQNetwork(object):
                                                                    self.error_weight,
                                                                    self.kl_weight)
             else:
-                (self.q_stds,
-                 self.q_values,
-                 self.q_values_means,
+                (self.q_values,
                  self.td_error,
                  self.weighted_error,
                  self.weighted_bayesian_loss,
@@ -614,7 +608,6 @@ class DeepBBQNetwork(object):
                  self.q_fn_vars,
                  self.q_tp1_vars) = self._build_single_q_network(self.observations,
                                                                    self.head,
-                                                                   self.aleatoric_head,
                                                                    self.state_t,
                                                                    self.state_tp1,
                                                                    self.done_mask,
@@ -626,9 +619,6 @@ class DeepBBQNetwork(object):
 
             print('single q network built.' + '\n')
             self.action = self._action_train(self.q_values)
-            self.action_ids = self._action_train_ids(self.q_values, self.q_values_means, self.q_stds)
-            if self.hparams.reward_eng:
-                self.ids, self.info_gain, self.e_uncert = self.ids(self.q_values, self.q_values_means, self.q_stds)
 
     def _action_train(self, q_vals):  # add a mode here?
         """Defines the action selection policy during training.
@@ -638,51 +628,6 @@ class DeepBBQNetwork(object):
 
         """
         return tf.argmax(q_vals)
-
-    def _action_train_ids(self, q_values, q_values_means, q_stds):
-
-        ids_score, _, _ = self.ids(q_values, q_values_means)
-
-        a = tf.argmin(ids_score, axis=0)
-
-        return a
-
-    def ids(self, q_values, q_values_means, q_stds):
-
-        # Compute epistemic uncertainty
-        if not self.hparams.use_clt:
-            mu, e_uncert, std = compute_epistemic(q_values, q_values_means, self.head, self.layers_online,
-                                                    self.hparams.dense_layers, self.hparams.n_samples,
-                                                    self.hparams.e_type)
-        else:
-            mu = q_values
-            e_uncert = tf.pow(q_stds, 2)
-            std = q_stds
-
-        # Compute normalised aleatory uncertainty
-        a_uncert_norm = compute_aleatory(compute_log_predictive_variance(q_values_means, self.aleatoric_head))
-
-        # Compute Regret
-        regret = compute_regret(mu, std, self.num_sigma)
-
-        # Compute Information Gain
-        info_gain = compute_ig(e_uncert, a_uncert_norm)
-
-        ids_score = compute_ids(regret, info_gain)
-
-        return ids_score, info_gain, e_uncert
-
-    def get_ids_score(self, state_t, head, aleatoric_head):
-        ids = tf.get_default_session().run(self.ids, feed_dict={self.observations: state_t,
-                                                                      self.head: head,
-                                                                      self.aleatoric_head: aleatoric_head})
-        info_gain = tf.get_default_session().run(self.info_gain, feed_dict={self.observations: state_t,
-                                                                    self.head: head,
-                                                                    self.aleatoric_head: aleatoric_head})
-        e_uncert = tf.get_default_session().run(self.e_uncert, feed_dict={self.observations: state_t,
-                                                                    self.head: head,
-                                                                    self.aleatoric_head: aleatoric_head})
-        return ids, info_gain, e_uncert
 
     def _build_training_ops(self):
         """Creates the training operations.
@@ -805,6 +750,7 @@ class DeepBBQNetwork(object):
                    observations,
                    stochastic=True,
                    head=0,
+                   episode=None,
                    update_epsilon=None): # sn=None if changing TS freq.
         """Function that chooses an action given the observations.
 
@@ -829,20 +775,7 @@ class DeepBBQNetwork(object):
         else:
             return self._run_action_op(observations, head) # sn
 
-    def get_ids_action(self, obs, head, a_head, update_epsilon):
-        if update_epsilon is not None:
-            self.epsilon = update_epsilon
-
-        action = np.asscalar(tf.get_default_session().run(self.action_ids, feed_dict={self.observations: obs,
-                                                                                  self.head: head,
-                                                                                  self.aleatoric_head: a_head}))
-
-        if np.random.uniform() < self.epsilon:
-            return np.random.randint(0, obs.shape[0])
-        else:
-            return action
-
-    def train(self, states, rewards, next_states, done, weight, kl_weight, ep, head, aleatoric_head, summary=True):
+    def train(self, states, rewards, next_states, done, weight, kl_weight, ep, summary=True):
         """Function that takes a transition (s,a,r,s') and optimizes Bellman error.
 
     Args:
@@ -881,9 +814,7 @@ class DeepBBQNetwork(object):
                      self.done_mask: done,
                      self.error_weight: weight,
                      self.kl_weight: kl_weight,
-                     self.episode: ep,
-                     self.head: head,
-                     self.aleatoric_head: aleatoric_head}
+                     self.episode: ep}
         for i, next_state in enumerate(next_states):
             feed_dict[self.state_tp1[i]] = next_state
         return tf.get_default_session().run(ops, feed_dict=feed_dict)
@@ -1176,14 +1107,14 @@ def get_hparams(**kwargs):
     A HParams object containing all the hyperparameters.
   """
     hparams = contrib_training.HParams(
-        atom_types=['C', 'O', 'N'],
+        atom_types=['C', 'O', 'N', 'F'],
         max_steps_per_episode=40,
         allow_removal=True,
         allow_no_modification=True,
         allow_bonds_between_rings=False,
-        allowed_ring_sizes=[5, 6],  # [5,6]
+        allowed_ring_sizes=[3, 4, 5, 6, 7],  # [5,6]
         replay_buffer_size=5000,  # 1000000, 5000 (default)
-        learning_rate=1e-3,
+        learning_rate=1e-4,
         learning_rate_decay_steps=10000,
         learning_rate_decay_rate=0.9,  # 0.8
         num_episodes=5000,  # 5000 for optimize_qed
@@ -1211,24 +1142,20 @@ def get_hparams(**kwargs):
         weighting_type=None,
         num_mixtures=2,
         prior_target=4.25,
-        prior_type='mixed',  # mixed, single, student, ard
+        prior_type='ard',  # mixed, single, student, ard
         bayesian_loss='MC',  # MC or Closed
-        sigma_prior=(float(np.exp(-0.5, dtype=np.float32)), float(np.exp(-2.0, dtype=np.float32))),
+        sigma_prior=(float(np.exp(-1.0, dtype=np.float32)), float(np.exp(-2.0, dtype=np.float32))),
         var_range=[-4.6, -3.9],
         target_type='Sample',  # Sample
         doubleq_type='Sample',  # MAP
         use_bias=True,
-        use_clt=False, # True
-        n_samples=10,
-        variance_parameterisation_type='additive',  # layer_wise, neuron_wise, weight_wise, additive
+        use_clt=True,
+        n_samples=1,
+        variance_parameterisation_type='layer_wise',  # layer_wise, neuron_wise, weight_wise, additive
         opt='optimize_loss',
         multi_obj=False,
         rbs=False,
-        uq='stochastic', # stochastic generally beter than closed_form, but less efficient
-        e_type=1, # [1,2]
-        exp='ids', # ['ids', 'thompson']
-        reward_eng=None # [ids, ids_2, info_gain, info_gain_2, e1, e2, None]
-        )
+        uq='stochastic')  # stochastic generally beter than closed_form, but less efficient
     return hparams.override_from_dict(kwargs)
 
 

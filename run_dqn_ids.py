@@ -47,6 +47,7 @@ import deep_q_networks_ids
 import molecules_ids as molecules_mdp
 import molecules_py
 import core
+from store_best_molecules import MoleculeMonitor
 
 flags.DEFINE_string('model_dir',
                     '',
@@ -236,6 +237,9 @@ def run_training(hparams, environment, dqn_ids):
         None
       """
     summary_writer = tf.summary.FileWriter(FLAGS.model_dir)
+
+    molecule_monitor = MoleculeMonitor(FLAGS.model_dir)
+
     tf.reset_default_graph()
     with tf.Session() as sess:
 
@@ -279,6 +283,7 @@ def run_training(hparams, environment, dqn_ids):
                 global_step=global_step,
                 hparams=hparams,
                 summary_writer=summary_writer,
+                molecule_monitor=molecule_monitor,
                 exploration=exploration,
                 beta_schedule=beta_schedule)
             # Update the target network every 'hparams.update_frequency' episodes
@@ -288,8 +293,10 @@ def run_training(hparams, environment, dqn_ids):
             if (episode + 1) % hparams.save_frequency == 0:
                 model_saver.save(sess, os.path.join(FLAGS.model_dir, 'ckpt'), global_step=global_step)
 
+        molecule_monitor.store_molecules()
 
-def _episode(environment, dqn_ids, memory, episode, global_step, hparams, summary_writer, exploration, beta_schedule):
+
+def _episode(environment, dqn_ids, memory, episode, global_step, hparams, summary_writer, molecule_monitor, exploration, beta_schedule):
     """Runs a single episode.
 
       Args:
@@ -315,6 +322,7 @@ def _episode(environment, dqn_ids, memory, episode, global_step, hparams, summar
     else:
         head = 0
         aleatoric_head = 1
+    episode_sequence = []
     for step in range(hparams.max_steps_per_episode):
         # Takes a step
         result = _step(
@@ -326,18 +334,37 @@ def _episode(environment, dqn_ids, memory, episode, global_step, hparams, summar
             exploration=exploration,
             head=head,
             aleatoric_head=aleatoric_head)
+        episode_sequence.append(result)
+
+        molecule_monitor.add_molecule(state=result.state,
+                                      reward=result.reward)
+
+        if hparams.re:
+            episode_summary, adjusted_episode_summary = dqn_ids.log_result(result.state, result.reward,
+                                                                           result.reward_adjusted)
+            summary_writer.add_summary(adjusted_episode_summary, global_step)
+        else:
+            episode_summary = dqn_ids.log_result(result.state, result.reward, None)
+        summary_writer.add_summary(episode_summary, global_step)
+
         if step == hparams.max_steps_per_episode - 1:
-            if hparams.re:
-                episode_summary, adjusted_episode_summary = dqn_ids.log_result(result.state, result.reward,
-                                                                               result.reward_adjusted)
-                summary_writer.add_summary(adjusted_episode_summary, global_step)
-            else:
-                episode_summary = dqn_ids.log_result(result.state, result.reward, None)
-            summary_writer.add_summary(episode_summary, global_step)
+            max_reward = 0.0
+            best_state = None
+            for e in episode_sequence:
+                if e.reward > max_reward:
+                    max_reward = e.reward
+                    best_state = e.state
+            # if hparams.re:
+            #     episode_summary, adjusted_episode_summary = dqn_ids.log_result(result.state, result.reward,
+            #                                                                    result.reward_adjusted)
+            #     summary_writer.add_summary(adjusted_episode_summary, global_step)
+            # else:
+            #     episode_summary = dqn_ids.log_result(result.state, result.reward, None)
+            # summary_writer.add_summary(episode_summary, global_step)
             logging.info('Episode %d/%d took %gs', episode + 1, hparams.num_episodes, time.time() - episode_start_time)
-            logging.info('SMILES: %s\n', result.state)
+            logging.info('SMILES: %s\n', best_state)
             # Use %s since reward can be a tuple or a float number.
-            logging.info('The reward is: %s', str(result.reward))
+            logging.info('The reward is: %s', str(max_reward))
         # Waits for the replay buffer to contain at least 50 * max_steps_per_episode t
         # transitions before sampling and updating the dqn
         if (episode > min(50, hparams.num_episodes / 10)) and (global_step % hparams.learning_frequency == 0):

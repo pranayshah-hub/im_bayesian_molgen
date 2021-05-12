@@ -43,14 +43,16 @@ from rdkit.Chem import QED
 from six.moves import range
 import tensorflow.compat.v1 as tf
 from tensorflow.compat.v1 import gfile
-import b_deep_q_networks
+import b_deep_q_networks_correct
 import molecules as molecules_mdp
 import molecules_py
 import core
+from store_best_molecules import MoleculeMonitor
 from collections import deque
 
 flags.DEFINE_string('model_dir',
-                    '',
+                    # '/vol/bitbucket/pds14/bdqn/56lr3SMAP_sig1_rb1e4_bs16_7',
+                    '/data/PycharmProjects/B2Q_code/bdqn_allrings_moreatoms',
                     'The directory to save data to.')
 flags.DEFINE_string('target_molecule', 'C1CCC2CCCCC2C1',
                     'The SMILES string of the target molecule.')
@@ -245,8 +247,14 @@ def run_training(hparams, environment, bdqn):
         None
       """
     summary_writer = tf.summary.FileWriter(FLAGS.model_dir)
-    tf.reset_default_graph()
+
+    molecule_monitor = MoleculeMonitor(FLAGS.model_dir)
+
+    # tf.reset_default_graph()
     with tf.Session() as sess:
+
+        #tf.set_random_seed(1234)
+        #np.random.seed(1234)
 
         # Build the dqn
         bdqn.build()
@@ -268,30 +276,31 @@ def run_training(hparams, environment, bdqn):
             beta_schedule = None
 
         # The schedule for the Bayesian Loss
-        kl_schedule = schedules.LinearSchedule(hparams.num_episodes, 1e-6, initial_p=1e-5)
+        kl_schedule = schedules.LinearSchedule(hparams.num_episodes, 1e-6, initial_p=5e-6)
 
         # Run the session with the global variables initialiser
         # sess.run(tf.global_variables_initializer())
         sess.run(tf.initialize_all_variables())
 
         # Update the dqn for the first time after initialising all variables
-        sess.run(bdqn.update_op1)
+        sess.run(bdqn.update_op)
         if hparams.thomp_freq == 20:
             sess.run(bdqn.update_op2)
 
         # Run an episode
         global_step = 0
         for episode in range(hparams.num_episodes):
-            global_step, sequence_buffer = _episode(environment=environment,
-                                                    bdqn=bdqn,
-                                                    memory=memory,
-                                                    episode=episode,
-                                                    global_step=global_step,
-                                                    hparams=hparams,
-                                                    summary_writer=summary_writer,
-                                                    exploration=exploration,
-                                                    beta_schedule=beta_schedule,
-                                                    kl_weight_schedule=kl_schedule)
+            global_step = _episode(environment=environment,
+                                   bdqn=bdqn,
+                                   memory=memory,
+                                   episode=episode,
+                                   global_step=global_step,
+                                   hparams=hparams,
+                                   summary_writer=summary_writer,
+                                   molecule_monitor=molecule_monitor,
+                                   exploration=exploration,
+                                   beta_schedule=beta_schedule,
+                                   kl_weight_schedule=kl_schedule)
             # Update the target network every 'hparams.update_frequency' episodes
             if (episode + 1) % hparams.update_frequency == 0:
                 sess.run(bdqn.update_op)
@@ -303,9 +312,11 @@ def run_training(hparams, environment, bdqn):
             if (episode + 1) % hparams.save_frequency == 0:
                 model_saver.save(sess, os.path.join(FLAGS.model_dir, 'ckpt'), global_step=global_step)
 
+        molecule_monitor.store_molecules()
+
 
 def _episode(environment, bdqn, memory, episode, global_step,
-             hparams, summary_writer, exploration, beta_schedule, kl_weight_schedule):
+             hparams, summary_writer, molecule_monitor, exploration, beta_schedule, kl_weight_schedule):
     """Runs a single episode.
 
       Args:
@@ -348,13 +359,26 @@ def _episode(environment, bdqn, memory, episode, global_step,
             exploration=exploration,
             head=head)
         episode_sequence.append(result)
+
+        molecule_monitor.add_molecule(state=result.state,
+                                      reward=result.reward)
+
+        episode_summary = bdqn.log_result(result.state, result.reward)
+        summary_writer.add_summary(episode_summary, global_step)
+
         if step == hparams.max_steps_per_episode - 1:
-            episode_summary = bdqn.log_result(result.state, result.reward)
-            summary_writer.add_summary(episode_summary, global_step)
+            max_reward = 0.0
+            best_state = None
+            for e in episode_sequence:
+                if e.reward > max_reward:
+                    max_reward = e.reward
+                    best_state = e.state
+            # episode_summary = bdqn.log_result(result.state, result.reward)
+            # summary_writer.add_summary(episode_summary, global_step)
             logging.info('Episode %d/%d took %gs', episode + 1, hparams.num_episodes, time.time() - episode_start_time)
-            logging.info('SMILES: %s', result.state)
+            logging.info('SMILES: %s', best_state)
             # Use %s since reward can be a tuple or a float number.
-            logging.info('The reward is: %s\n', str(result.reward))
+            logging.info('The reward is: %s\n', str(max_reward))
         # Waits for the replay buffer to contain at least 50 * max_steps_per_episode t
         # transitions before sampling and updating the dqn
         if (episode > min(50, hparams.num_episodes / 10)) and (global_step % hparams.learning_frequency == 0):
@@ -379,9 +403,7 @@ def _episode(environment, bdqn, memory, episode, global_step,
              weighted_error_summary,
              bayesian_loss_summary,
              total_loss,
-             total_loss_summary,
-             grad_var,
-             grad_var_summary, log_like_var_summary, _) = bdqn.train(states=state_t,
+             total_loss_summary, _) = bdqn.train(states=state_t,
                                                                      rewards=reward_t,
                                                                      next_states=state_tp1,
                                                                      done=np.expand_dims(done_mask, axis=1),
@@ -391,13 +413,15 @@ def _episode(environment, bdqn, memory, episode, global_step,
             summary_writer.add_summary(weighted_error_summary, global_step)
             summary_writer.add_summary(bayesian_loss_summary, global_step)
             summary_writer.add_summary(total_loss_summary, global_step)
-            summary_writer.add_summary(grad_var_summary, global_step)
-            summary_writer.add_summary(log_like_var_summary, global_step)
+            # summary_writer.add_summary(grad_var_summary, global_step)
+            # summary_writer.add_summary(log_like_var_summary, global_step)
+
             logging.info('Current Log Likelihood Loss (TD Error): %.4f', np.mean(np.abs(log_weighted_error)))
             logging.info('Current KL Weight: {:.7f}'.format(np.mean(np.abs(kl_weight))))
             logging.info('Current Bayesian loss: {:.9f}'.format(np.mean(np.abs(weighted_bayesian_loss))))
             logging.info('Current Total loss: {:.4f}'.format(np.mean(np.abs(total_loss))))
-            logging.info('Current variance of gradient: {:.9f}'.format(np.mean(grad_var)))
+
+            # logging.info('Current variance of gradient: {:.9f}'.format(np.mean(grad_var)))
             if hparams.prioritized:
                 memory.update_priorities(indices, np.abs(np.squeeze(td_error) + hparams.prioritized_epsilon).tolist())
         global_step += 1
@@ -429,7 +453,7 @@ def _step(environment, bdqn, memory, episode, hparams, exploration, head):
     valid_actions = list(environment.get_valid_actions())
     # Get observations (np.array versions (from get fingerprint function)) of all possible new states (valid_actions)
     observations = np.vstack(
-        [np.append(b_deep_q_networks.get_fingerprint(act, hparams), steps_left) for act in valid_actions])
+        [np.append(b_deep_q_networks_correct.get_fingerprint(act, hparams), steps_left) for act in valid_actions])
     # Chooses an action out of the above observations using epsilon greedy exploration
     '''if hparams.thomp_freq == 20:
         if steps_left <= hparams.thomp_freq:
@@ -441,15 +465,15 @@ def _step(environment, bdqn, memory, episode, hparams, exploration, head):
     action = bdqn.get_action(observations, head=head, episode=episode, update_epsilon=exploration.value(episode))
     action = valid_actions[action]
     # Gets the fingerprint of the chosen action (new state) and appends the no. steps left to the array
-    # action_t_fingerprint = np.append(b_deep_q_networks.get_fingerprint(action, hparams), steps_left)
-    action_t_fingerprint = np.append(b_deep_q_networks.get_fingerprint(action, hparams), steps_left)
+    # action_t_fingerprint = np.append(b_deep_q_networks_correct.get_fingerprint(action, hparams), steps_left)
+    action_t_fingerprint = np.append(b_deep_q_networks_correct.get_fingerprint(action, hparams), steps_left)
     # Take the step in the Molecule MDP environment and stores the Result in result
     result = environment.step(action)
     # Recalculate the remaining number of steps
     steps_left = hparams.max_steps_per_episode - environment.num_steps_taken
     # Gets the fingerprints of all valid next actions (states)
     # from the new current state just calculated and adds the transitions to memory
-    action_fingerprints = np.vstack([np.append(b_deep_q_networks.get_fingerprint(act, hparams), steps_left) for act in
+    action_fingerprints = np.vstack([np.append(b_deep_q_networks_correct.get_fingerprint(act, hparams), steps_left) for act in
                                      environment.get_valid_actions()])
     # we store the fingerprint of the action in obs_t so action
     # does not matter here.
@@ -472,9 +496,9 @@ def run_bdqn(multi_objective=False):
       """
     if FLAGS.hparams is not None:
         with gfile.Open(FLAGS.hparams, 'r') as f:
-            hparams = b_deep_q_networks.get_hparams(**json.load(f))
+            hparams = b_deep_q_networks_correct.get_hparams(**json.load(f))
     else:
-        hparams = b_deep_q_networks.get_hparams()
+        hparams = b_deep_q_networks_correct.get_hparams()
     logging.info('HParams:\n%s',
                  '\n'.join(['\t%s: %s' % (key, value) for key, value in sorted(hparams.values().items())]))
 
@@ -490,10 +514,10 @@ def run_bdqn(multi_objective=False):
             allowed_ring_sizes={3, 4, 5, 6},
             max_steps=hparams.max_steps_per_episode)
 
-        bdqn = b_deep_q_networks.MultiObjectiveDeepBBQNetwork(
+        bdqn = b_deep_q_networks_correct.MultiObjectiveDeepBBQNetwork(
             objective_weight=np.array([[FLAGS.similarity_weight], [1 - FLAGS.similarity_weight]]),
             input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
-            # q_fn=functools.partial(b_deep_q_networks.multi_layer_bayesian_model, hparams=hparams),
+            # q_fn=functools.partial(b_deep_q_networks_correct.multi_layer_bayesian_model, hparams=hparams),
             optimizer=hparams.optimizer,
             grad_clipping=hparams.grad_clipping,
             num_bootstrap_heads=hparams.num_bootstrap_heads,
@@ -510,9 +534,9 @@ def run_bdqn(multi_objective=False):
             allowed_ring_sizes=set(hparams.allowed_ring_sizes),
             max_steps=hparams.max_steps_per_episode)
 
-        bdqn = b_deep_q_networks.DeepBBQNetwork(
+        bdqn = b_deep_q_networks_correct.DeepBBQNetwork(
             input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
-            q_fn=functools.partial(b_deep_q_networks.multi_layer_bayesian_model, hparams=hparams),
+            q_fn=functools.partial(b_deep_q_networks_correct.multi_layer_bayesian_model, hparams=hparams),
             # q_fn=MLP(hparams),
             optimizer=hparams.optimizer,
             grad_clipping=hparams.grad_clipping,

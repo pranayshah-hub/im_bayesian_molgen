@@ -43,13 +43,14 @@ from rdkit.Chem import QED
 from six.moves import range
 import tensorflow.compat.v1 as tf
 from tensorflow.compat.v1 import gfile
-import b_deep_q_networks_ids
+import b_deep_q_networks_ids_refactored
 import molecules_ids as molecules_mdp
 import molecules_py
 import core
+from store_best_molecules import MoleculeMonitor
 
 flags.DEFINE_string('model_dir',
-                    '',
+                    '/vol/bitbucket/pds14/bdqn_ids/56lr3SS10_uf10_bs16',
                     'The directory to save data to.')
 flags.DEFINE_string('target_molecule', 'C1CCC2CCCCC2C1',
                     'The SMILES string of the target molecule.')
@@ -65,7 +66,6 @@ flags.DEFINE_boolean('multi_objective', False,
                      'Whether to run multi objective DQN.')
 
 FLAGS = flags.FLAGS
-
 
 # This is the environment
 class TargetWeightMolecule(molecules_mdp.Molecule):
@@ -245,6 +245,9 @@ def run_training(hparams, environment, bdqn):
         None
       """
     summary_writer = tf.summary.FileWriter(FLAGS.model_dir)
+
+    molecule_monitor = MoleculeMonitor(FLAGS.model_dir)
+
     tf.reset_default_graph()
     with tf.Session() as sess:
 
@@ -255,12 +258,12 @@ def run_training(hparams, environment, bdqn):
         model_saver = tf.train.Saver(max_to_keep=hparams.max_num_checkpoints)
 
         # The schedule for the epsilon in epsilon greedy policy.
-        if hparams.exp == 'thompson'
+        if hparams.exp == 'thompson':
             exploration = schedules.PiecewiseSchedule(
-                [(0, 1.0), (int(hparams.num_episodes / 2), 0.1), (hparams.num_episodes, 0.01)], outside_value=0.01)
+                [(0, 1.0), (int(hparams.num_episodes * 0.5), 0.1), (hparams.num_episodes, 0.01)], outside_value=0.01)
         else:
             exploration = schedules.PiecewiseSchedule(
-                [(0, 1.0), (int(hparams.num_episodes * 0.4), 0.1), (hparams.num_episodes, 0.01)], outside_value=0.01)
+                [(0, 1.0), (int(hparams.num_episodes * 0.5), 0.1), (hparams.num_episodes, 0.01)], outside_value=0.01)
 
         # Define the memory variable as Prioritised Experience Replay Buffer from baselines modules
         if hparams.prioritized:
@@ -292,6 +295,7 @@ def run_training(hparams, environment, bdqn):
                 global_step=global_step,
                 hparams=hparams,
                 summary_writer=summary_writer,
+                molecule_monitor=molecule_monitor,
                 exploration=exploration,
                 beta_schedule=beta_schedule,
                 # kl_weight_schedule=KLSchedule(hparams, ep=episode, weighting_type=hparams.weighting_type)
@@ -303,8 +307,10 @@ def run_training(hparams, environment, bdqn):
             if (episode + 1) % hparams.save_frequency == 0:
                 model_saver.save(sess, os.path.join(FLAGS.model_dir, 'ckpt'), global_step=global_step)
 
+        molecule_monitor.store_molecules()
 
-def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_writer, exploration, beta_schedule,
+
+def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_writer, molecule_monitor, exploration, beta_schedule,
              kl_weight_schedule):
     """Runs a single episode.
 
@@ -325,10 +331,12 @@ def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_w
       Returns:
         Updated global_step.
       """
+    episode_start_time = time.time()
     environment.initialize()
     head = 0
     aleatoric_head = int(1)
-    sample_number = np.random.randint(0, hparams.num_samples)
+    sample_number = np.random.randint(0, hparams.n_samples)
+    episode_sequence = []
     for step in range(hparams.max_steps_per_episode):
         # Takes a step
         result = _step_nheads(
@@ -343,18 +351,30 @@ def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_w
             aleatoric_head=aleatoric_head,
             sample_number=sample_number,
             summary_writer=summary_writer)
+        episode_sequence.append(result)
+
+        molecule_monitor.add_molecule(state=result.state,
+                                      reward=result.reward)
+
+        if hparams.reward_eng:
+            episode_summary, adjusted_episode_summary = bdqn.log_result(result.state, result.reward)
+            summary_writer.add_summary(adjusted_episode_summary, global_step)
+        else:
+            episode_summary = bdqn.log_result(result.state, result.reward)
+        summary_writer.add_summary(episode_summary, global_step)
+
         if step == hparams.max_steps_per_episode - 1:
-            if hparams.re:
-                episode_summary, adjusted_episode_summary = bdqn.log_result(result.state, result.reward,
-                                                                            result.reward_adjusted)
-                summary_writer.add_summary(adjusted_episode_summary, global_step)
-            else:
-                episode_summary = bdqn.log_result(result.state, result.reward, None)
-            summary_writer.add_summary(episode_summary, global_step)
+            max_reward = 0.0
+            best_state = None
+            for e in episode_sequence:
+                if e.reward > max_reward:
+                    max_reward = e.reward
+                    best_state = e.state
             logging.info('Episode %d/%d took %gs', episode + 1, hparams.num_episodes, time.time() - episode_start_time)
-            logging.info('SMILES: %s', result.state)
+            logging.info('SMILES: %s', best_state)
             # Use %s since reward can be a tuple or a float number.
-            logging.info('The raw reward is: %s\n', str(result.reward))
+            # logging.info('IDS term: %s ', str(result.ids_term)) # Used for reward_eng only
+            logging.info('The raw reward is: %s\n', str(max_reward))
             # logging.info('The adjusted reward is: %s\n', str(result.reward_adjusted))
         # Waits for the replay buffer to contain at least 50 * max_steps_per_episode t
         # transitions before sampling and updating the dqn
@@ -395,16 +415,15 @@ def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_w
             else:
                 (td_error,
                  weighted_error,
-                 predictive_mean_summary,
                  weighted_bayesian_loss,
                  weighted_error_summary,
                  bayesian_loss_summary,
-                 aleatoric_uncertainty, aleatoric_summary, aleatoric_normalised_summary,
-                 epistemic_uncertainty, epistemic_uncertainty2, epistemic_summary, epistemic_summary2,
+                 # aleatoric_uncertainty, aleatoric_summary, aleatoric_normalised_summary,
+                 # epistemic_uncertainty, epistemic_uncertainty2, epistemic_summary, epistemic_summary2,
                  # mean_hist, std_hist,
                  # regret_hist, inf_gain_hist, ids_hist,
-                 grad_var_summary,
-                 log_like_var_summary,
+                 #grad_var_summary,
+                 #log_like_var_summary,
                  total_loss,
                  total_loss_summary, _) = bdqn.train(states=state_t,
                                                      rewards=reward_t,
@@ -415,20 +434,20 @@ def _episode(environment, bdqn, memory, episode, global_step, hparams, summary_w
                                                      ep=episode_tensor,
                                                      head=head,
                                                      aleatoric_head=aleatoric_head)
-            summary_writer.add_summary(predictive_mean_summary, global_step)
+            # summary_writer.add_summary(predictive_mean_summary, global_step)
             summary_writer.add_summary(weighted_error_summary, global_step)
             summary_writer.add_summary(bayesian_loss_summary, global_step)
             summary_writer.add_summary(total_loss_summary, global_step)
-            summary_writer.add_summary(aleatoric_summary, global_step)
-            summary_writer.add_summary(aleatoric_normalised_summary, global_step)
-            summary_writer.add_summary(epistemic_summary, global_step)
-            summary_writer.add_summary(grad_var_summary, global_step)
-            summary_writer.add_summary(log_like_var_summary, global_step)
+            # summary_writer.add_summary(aleatoric_summary, global_step)
+            # summary_writer.add_summary(aleatoric_normalised_summary, global_step)
+            # summary_writer.add_summary(epistemic_summary, global_step)
+            #summary_writer.add_summary(grad_var_summary, global_step)
+            #summary_writer.add_summary(log_like_var_summary, global_step)
             logging.info('Current Log Likelihood Loss (TD Error): %.4f', np.mean(np.abs(weighted_error)))
             logging.info('Current KL Weight: {:.7f}'.format(np.mean(np.abs(kl_weight))))
             logging.info('Current Bayesian loss: {:.4f}'.format(np.mean(np.abs(weighted_bayesian_loss))))
-            logging.info('Current Epistemic Uncertainty: {:.10f}'.format(np.mean(np.abs(epistemic_uncertainty))))
-            logging.info('Current Aleatoric Uncertainty: {:.7f}'.format(np.mean(np.abs(np.exp(aleatoric_uncertainty)))))
+            # logging.info('Current Epistemic Uncertainty: {:.10f}'.format(np.mean(np.abs(epistemic_uncertainty))))
+            # logging.info('Current Aleatoric Uncertainty: {:.7f}'.format(np.mean(np.abs(np.exp(aleatoric_uncertainty)))))
             logging.info('Current Total loss: {:.4f}'.format(np.mean(np.abs(total_loss))))
             if hparams.prioritized:
                 memory.update_priorities(indices, np.abs(np.squeeze(td_error) + hparams.prioritized_epsilon).tolist())
@@ -460,19 +479,19 @@ def _step_nheads(environment, bdqn, memory, episode, global_step, hparams, explo
     # Get observations (np.array versions (from get fingerprint function)) of all possible new states (valid_actions) from the current state
     # These are the available actions from the current state
     observations = np.vstack(
-        [np.append(b_deep_q_networks_ids.get_fingerprint(act, hparams), steps_left) for act in valid_actions])
+        [np.append(b_deep_q_networks_ids_refactored.get_fingerprint(act, hparams), steps_left) for act in valid_actions])
 
     # Find the mean and variance of the Q-values for each valid action:
-    if hparams.exp == 'ids':
+    if hparams.exp == 'ids' and not hparams.reward_eng:
         if episode > min(100, hparams.num_episodes / 10):
             action_index = bdqn.get_ids_action(observations, head, aleatoric_head,
                                                update_epsilon=exploration.value(episode))
             action = valid_actions[action_index]
-            action_t_fingerprint = np.append(b_deep_q_networks_ids.get_fingerprint(action, hparams), steps_left)
+            action_t_fingerprint = np.append(b_deep_q_networks_ids_refactored.get_fingerprint(action, hparams), steps_left)
             result = environment.step(action)
             steps_left = hparams.max_steps_per_episode - environment.num_steps_taken
             action_tp1_fingerprints = np.vstack(
-                [np.append(b_deep_q_networks_ids.get_fingerprint(act, hparams), steps_left) for act in
+                [np.append(b_deep_q_networks_ids_refactored.get_fingerprint(act, hparams), steps_left) for act in
                  environment.get_valid_actions()])
     
             memory.add(
@@ -483,16 +502,15 @@ def _step_nheads(environment, bdqn, memory, episode, global_step, hparams, explo
                 done=float(result.terminated))
         else:
             # Chooses an action out of the above observations using epsilon greedy exploration
-            action_index = bdqn.get_action(observations, head=head, aleatoric_head=aleatoric_head,
-                                           sample_number=sample_number, update_epsilon=exploration.value(episode))
+            action_index = bdqn.get_action(observations, head=head, update_epsilon=exploration.value(episode))
             action = valid_actions[action_index]
-            action_t_fingerprint = np.append(b_deep_q_networks_ids.get_fingerprint(action, hparams), steps_left)
+            action_t_fingerprint = np.append(b_deep_q_networks_ids_refactored.get_fingerprint(action, hparams), steps_left)
             result = environment.step(action)
             # Recalculate the remaining number of steps
             steps_left = hparams.max_steps_per_episode - environment.num_steps_taken
             # Gets the fingerprints of all valid next actions (states) from the new current state just calculated and adds the transitions to memory
             action_tp1_fingerprints = np.vstack(
-                [np.append(b_deep_q_networks_ids.get_fingerprint(act, hparams), steps_left) for act in
+                [np.append(b_deep_q_networks_ids_refactored.get_fingerprint(act, hparams), steps_left) for act in
                   environment.get_valid_actions()])
             memory.add(
                 obs_t=action_t_fingerprint,
@@ -500,10 +518,9 @@ def _step_nheads(environment, bdqn, memory, episode, global_step, hparams, explo
                 reward=result.reward,  # For ids action selection
                 obs_tp1=action_tp1_fingerprints,
                 done=float(result.terminated))
-    else:
+    elif hparams.exp == 'thompson' and not hparams.reward_eng:
         # Chooses an action out of the above observations using epsilon greedy exploration
-        action_index = bdqn.get_action(observations, head=head, aleatoric_head=aleatoric_head,
-                                       sample_number=sample_number, update_epsilon=exploration.value(episode))
+        action_index = bdqn.get_action(observations, head=head, update_epsilon=exploration.value(episode))
         action = valid_actions[action_index]
         action_t_fingerprint = np.append(b_deep_q_networks_ids.get_fingerprint(action, hparams), steps_left)
         result = environment.step(action)
@@ -520,106 +537,55 @@ def _step_nheads(environment, bdqn, memory, episode, global_step, hparams, explo
             obs_tp1=action_tp1_fingerprints,
             done=float(result.terminated))
 
-    if hparams.re:
+    if hparams.reward_eng:
+        # Chooses an action out of the above observations using epsilon greedy exploration
+        action_index = bdqn.get_action(observations, head=head, update_epsilon=exploration.value(episode))
+        action = valid_actions[action_index]
         # Get information terms
-        (ids_scores, info_gains, e1, e1_norm, e2, e2_norm, mean_hist, std_hist, regret_hist, inf_gain_hist,
-         ids_hist) = bdqn.get_ids_score(observations, head, aleatoric_head)
+        (ids_scores, info_gains, e_uncert) = bdqn.get_ids_score(observations, head, aleatoric_head)
         ids_score = ids_scores[action_index]
-        ids_score_norm = ids_score
-        ids_score_2 = ids_score
-        ids_score_norm2 = ids_score
-        ids_true_norm = ids_score
-        ids_true_e1_norm = ids_score
         if info_gains is not None:
             info_gain = info_gains[action_index]
-            info_gain_norm = info_gain
-            info_gain_true_norm = info_gain
-            info_gain_true_e1_norm = info_gain
-        else:
-            info_gain = None
-            info_gain_norm = None
-            info_gain_true_norm = None
-            info_gain_true_e1_norm = None
-        if e1 is not None:
-            e1 = e1[action_index]
-        if e1_norm is not None:
-            e1_norm = e1_norm[action_index]
-        if e2 is not None:
-            e2 = e2
-        if e2_norm is not None:
-            e2_norm = e2_norm
+        if e_uncert is not None:
+            e_uncert = e_uncert[action_index]
+        #if e1_norm is not None:
+        #    e1_norm = e1_norm[action_index]
+        #if e2 is not None:
+        #    e2 = e2
+        #if e2_norm is not None:
+        #    e2_norm = e2_norm
         if hparams.reward_eng == 'ids':
-            print('ids: ' + str(ids_score) + '\t' + 'ids scaled: ' + str(ids_score * 1e-3))
+            print('ids: ' + str(ids_score) + '\t' + 'ids scaled: ' + str(ids_score * 1e-5)) # 1e-3, 1e-5
         else:
             ids_score = None
-        if hparams.reward_eng == 'ids_norm':
-            print('ids_norm: ' + str(ids_score_norm))
-        else:
-            ids_score_norm = None
         if hparams.reward_eng == 'ids_2':
-            print('ids_score_2: ' + str(ids_score_2 * 1e-8))
+            print('ids_score_2: ' + str(ids_score * 1e-8))
         else:
             ids_score_2 = None
-        if hparams.reward_eng == 'ids_norm2':
-            print('ids_score_norm2: ' + str(ids_score_norm2))
-        else:
-            ids_score_norm2 = None
-        if hparams.reward_eng == 'ids_true_norm':
-            print('ids_true_norm: ' + str(ids_true_norm))
-        else:
-            ids_true_norm = None
-        if hparams.reward_eng == 'ids_true_e1_norm':
-            print('ids_true_e1_norm: ' + str(ids_true_e1_norm))
-        else:
-            ids_true_e1_norm = None
         if hparams.reward_eng == 'info_gain':
             print('info_gain: ' + str(info_gain))
         else:
             info_gain = None
-        if hparams.reward_eng == 'info_gain_norm':
-            print('info_gain_norm: ' + str(info_gain_norm))
+        if hparams.reward_eng == 'e_uncert' or hparams.reward_eng == 'e_uncert2':
+            print(hparams.reward_eng + ': ' + str(e_uncert))
         else:
-            info_gain_norm = None
-        if hparams.reward_eng == 'info_gain_true_norm':
-            print('info_gain_true_norm: ' + str(info_gain_true_norm))
-        else:
-            info_gain_true_norm = None
-        if hparams.reward_eng == 'info_gain_true_e1_norm':
-            print('info_gain_true_e1_norm: ' + str(info_gain_true_e1_norm))
-        else:
-            info_gain_true_e1_norm = None
-        if hparams.reward_eng == 'e1':
-            print('e1: ' + str(e1))
-        else:
-            e1 = None
-        if hparams.reward_eng == 'e1_norm':
-            print('e1_norm: ' + str(e1_norm))
-        else:
-            e1_norm = None
-        if hparams.reward_eng == 'e2':
-            print('e2: ' + str(e2))
-        else:
-            e2 = None
-        if hparams.reward_eng == 'e2_norm':
-            print('e2_norm: ' + str(e2_norm))
-        else:
-            e2_norm = None
+            e_uncert = None
 
-        action_t_fingerprint = np.append(b_deep_q_networks_ids.get_fingerprint(action, hparams), steps_left)
+        action_t_fingerprint = np.append(b_deep_q_networks_ids_refactored.get_fingerprint(action, hparams), steps_left)
         # Take the step in the Molecule MDP environment and stores the Result in result
-        result = environment.step(action, ids_score=ids_score, ids_score_norm=ids_score_norm, ids_score_2=ids_score_2,
-                                  ids_score_norm2=ids_score_norm2,
-                                  ids_true_norm=ids_true_norm, ids_true_e1_norm=ids_true_e1_norm,
-                                  info_gain_true_norm=info_gain_true_norm,
-                                  info_gain_true_e1_norm=info_gain_true_e1_norm,
-                                  info_gain_norm=info_gain_norm, info_gain=info_gain, e1=e1, e1_norm=e1_norm, e2=e2,
-                                  e2_norm=e2_norm,
+        result = environment.step(action, ids_score=ids_score, ids_score_norm=None, ids_score_2=None,
+                                  ids_score_norm2=None,
+                                  ids_true_norm=None, ids_true_e1_norm=None,
+                                  info_gain_true_norm=None,
+                                  info_gain_true_e1_norm=None,
+                                  info_gain_norm=None, info_gain=info_gain, epistemic=e_uncert, e1_norm=None, e2=e_uncert,
+                                  e2_norm=None,
                                   multi_obj=hparams.multi_obj, lr=hparams.local_reparam)
         # Recalculate the remaining number of steps
         steps_left = hparams.max_steps_per_episode - environment.num_steps_taken
         # Gets the fingerprints of all valid next actions (states) from the new current state just calculated and adds the transitions to memory
         action_tp1_fingerprints = np.vstack(
-            [np.append(b_deep_q_networks_ids.get_fingerprint(act, hparams), steps_left) for act in
+            [np.append(b_deep_q_networks_ids_refactored.get_fingerprint(act, hparams), steps_left) for act in
              environment.get_valid_actions()])
         memory.add(
             obs_t=action_t_fingerprint,

@@ -448,7 +448,7 @@ class Molecule(object):
              ids_true_norm=None,
              ids_true_e1_norm=None, info_gain=None, info_gain_norm=None,
              info_gain_true_norm=None, info_gain_true_e1_norm=None,
-             e1=None, e1_norm=None, e2=None, e2_norm=None, multi_obj=False, lr=False):
+             epistemic=None, e1_norm=None, e2=None, e2_norm=None, multi_obj=False, lr=False):
         """Takes a step forward according to the action.
 
     Args:
@@ -576,15 +576,15 @@ class Molecule(object):
                     reward_adjusted=r,
                     ids_term=self.info_gain_true_e1_norm,
                     terminated=(self._counter >= self.max_steps) or self._goal_reached())
-            elif e1 is not None:
-                self.e1 = np.tanh(
-                    e1 * 1e6)  # 1e6 for stochastic, optimize_qed, re; no scale factor for closed uq + lr; 1e4 for stochastic, optimize_qed, lr + re
-                r = r_0 + self.e1 # -
+            elif epistemic is not None:
+                self.epistemic = np.tanh(
+                    epistemic * 1e6)  # 1e6 for stochastic, optimize_qed, re; no scale factor for closed uq + lr; 1e4 for stochastic, optimize_qed, lr + re
+                r = r_0 + self.epistemic  # -
                 result = Result(
                     state=self._state,
                     reward=r_0,
                     reward_adjusted=r,
-                    ids_term=self.e1,
+                    ids_term=self.epistemic,
                     terminated=(self._counter >= self.max_steps) or self._goal_reached())
             elif e1_norm is not None:
                 if e1_norm > 1:
