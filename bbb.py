@@ -4,15 +4,6 @@ import tensorflow as tf
 from bbb_utils import *
 
 
-# class WeightPriorVirtual:
-#     def __init__(self):
-#         pass
-#
-#     def calculate_kl(self,
-#                      var_par):
-#         pass
-
-
 class WeightPriorStudent:
     def __init__(self,):
         pass
@@ -93,7 +84,6 @@ class WeightPriorMOG:
             if i < 0.0:
                 raise ValueError('Invalid Mixture Weights. ')
 
-        # Georgios TODO: Saw both np and statistics mean() in versions. Am keeping commented the other.
         mixture_weights_norm = np.mean(mixture_weights)
         # mixture_weights_norm = statistics.mean(mixture_weights)
         mixture_weights = [m_w / mixture_weights_norm for m_w in mixture_weights]
@@ -109,7 +99,6 @@ class WeightPriorMOG:
             raise NotImplementedError("No approximate closed form calculation of KL-div implemented for MoGs.")
 
         # if self.hparams.prior_type == 'mixed':
-        #     # Georgios: Am a bit unsure what the below does, but looks super cool.
         #     p_s_m = [m_w * np.square(s) for m_w, s in zip(self._mixture_weights, self._sigma_prior)]
         #     p_s_m = np.sqrt(np.sum(p_s_m))
         #
@@ -238,18 +227,6 @@ class DenseReparameterisation(tf.keras.layers.Layer):
 
         self.bayesian_loss = None
 
-        # Variational parameters
-        # Georgios: Keeping same names for posterior sharpening if possible.
-        # self.W_mu = None
-        # self.W_rho = None
-        # if self.use_bias:
-        #     self.b_mu = None
-        #     self.b_rho = None
-
-        # Georgios TODO: Am unsure if the below are used now. Could leave.
-        # self.eps_out = tf.placeholder(tf.float32, (None, self.b_dims), name='eps_out')
-        # self.eps_out_sample = get_random((self._batch_size, self.b_dims), avg=0., std=1.)
-
     def build(self, input_shape):
 
         if len(input_shape) > 2:
@@ -366,7 +343,7 @@ class DenseReparameterisation(tf.keras.layers.Layer):
         #     self.phi_b = tf.Variable(np.full(self.b_dims, 0.01), name=self._name + '_phi_b', shape=self.b_dims,
         #                                  dtype=tf.float32)
 
-    def call(self,  # Georgios The args were remade to somewhat resemble keras layers.
+    def call(self,  # The args were remade to somewhat resemble keras layers.
              inputs,
              training,
              n_samples,
