@@ -293,7 +293,6 @@ class DeepBBQNetwork(object):
         out_mean = getattr(tf.nn, self.hparams.activation)(out_mean)
 
         # if self.hparams.batch_norm:
-        #     # TODO: Only one bn_1 layer? We don't use it so it's fine.
         #     outputs = tf.layers.batch_normalization(outputs, fused=True, name='bn_1', reuse=reuse)
 
         for i in range(1, len(self.hparams.dense_layers)):
@@ -312,7 +311,6 @@ class DeepBBQNetwork(object):
             out_samples = new_outputs
 
             # if self.hparams.batch_norm:
-            #     # TODO: Only one bn_1 layer? We don't use it so it's fine.
             #     outputs = tf.layers.batch_normalization(outputs, fused=True, name='bn_1', reuse=reuse)
 
         new_means = list()
@@ -341,7 +339,6 @@ class DeepBBQNetwork(object):
         #                                                                        sample_type="Sample")
         #     outputs = getattr(tf.nn, self.hparams.activation)(out_samples[0])
         #     if self.hparams.batch_norm:
-        #         # TODO: Only one bn_1 layer? We don't use it so it's fine.
         #         outputs = tf.layers.batch_normalization(outputs, fused=True, name='bn_1', reuse=reuse)
         #
         # out_mean, out_samples, out_std = layers_dict['dense_final'](inputs=outputs,
@@ -432,10 +429,6 @@ class DeepBBQNetwork(object):
         for i in range(len(self.hparams.dense_layers)):
             bayesian_loss += self.layers_online['dense_{}'.format(i)].get_bayesian_loss()
         bayesian_loss += self.layers_online['dense_final'].get_bayesian_loss()
-        # if all(state_t.shape):
-        #     if isinstance(state_t.shape[0], int):
-        #         bayesian_loss = tf.ones([state_t.shape[0], 1]) * bayesian_loss
-        #         print(bayesian_loss.shape)
 
         # Online network parameters
         q_fn_vars = tf.trainable_variables(scope=tf.get_variable_scope().name + '/q_fn')
@@ -509,10 +502,6 @@ class DeepBBQNetwork(object):
         td_error = td_target - q_t
 
         # Bayesian Loss (Expected variational log posterior - Expected log prior)
-        # if self.hparams.bayesian_loss == 'stochastic':
-        #     bayesian_loss = tf.reduce_mean(tf.abs(bayesian_loss))
-        # else:
-        #     bayesian_loss = tf.abs(bayesian_loss)
         weighted_bayesian_loss = bayesian_loss * kl_weight
 
         # Expected Log-likelihood Huber Loss
@@ -1142,8 +1131,8 @@ def get_hparams(**kwargs):
         weighting_type=None,
         num_mixtures=2,
         prior_target=4.25,
-        prior_type='ard',  # mixed, single, student, ard
-        bayesian_loss='MC',  # MC or Closed
+        prior_type='ard',  # mixed, single (CF known), student, ard (CF known)
+        bayesian_loss='MC',  # MC or Closed (refers to MoG prior only)
         sigma_prior=(float(np.exp(-1.0, dtype=np.float32)), float(np.exp(-2.0, dtype=np.float32))),
         var_range=[-4.6, -3.9],
         target_type='Sample',  # Sample
